@@ -1,4 +1,6 @@
-# Library Imports
+###############################################################################
+#Library Imports
+###############################################################################
 
 import pandas as pd
 import numpy as np
@@ -19,6 +21,10 @@ import model_monitoring_modules as mmm
 #modules to write to google sheets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+###############################################################################
+#Constants Definition
+###############################################################################
 
 # Avant prod details
 connection_name = 'us_fraud_follower'
@@ -43,7 +49,9 @@ BASELINE_WORKSHEET = 'Baselines Data'
 WEEKLY_WORKSHEET = 'Charts Data'
 TABLES_WORKSHEET = 'Tables Data'
 
-
+###############################################################################
+#Function Definitions
+###############################################################################
 
 #list of functions to do everything
 #SQL Query to pull base table data
@@ -64,9 +72,7 @@ SELECT
 , l.payment_method
 , l.loan_amount
 , ca.product_type
-, vrdt.risk_summary_identity_high
-, vrdt.risk_summary_identity_medium
-, vrdt.risk_summary_identity_low
+
 FROM avant.dw.customer_applications ca
 LEFT JOIN avant.dw.loans l on l.customer_application_id = ca.id
 JOIN avant.dw.customers c
@@ -109,11 +115,6 @@ LEFT JOIN avant.avant_basic.confirmed_fraud_logs cfl
   -- ON lp.loan_id = l.id 
   -- AND lp.installment_number = 1
   -- AND lp.installment_date <= date_add('day', -64, current_timestamp)
-
-  
-  -- adding identity tier a loan was assigned to and fraud_review flag
-  LEFT JOIN avant.dw_temp_newver.verifications_risks_decisions_test vrdt
-  on ca.id = vrdt.customer_application_id and vrdt.row_num_recent = 1
   
   
 WHERE l.created_date > date '{START_DATE}'
@@ -129,13 +130,21 @@ def base_table_creator(query = base_table_query):
     
 
 #Get monitoring metrics for each week
-def weekly_evaluator(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCORE_COL):
+def weekly_evaluator(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCORE_COL, amount = AMOUNT_COL):
     
+    #false positives, true negatives for false positive rate
+    true_positives = (dframe[ytrue] * dframe[ypred]).sum()
+    false_positives = ((1-dframe[ytrue]) * dframe[ypred]).sum()
+    false_negatives =  (dframe[ytrue] * (1-dframe[ypred])).sum()
+    true_negatives = ((1-dframe[ytrue]) * (1-dframe[ypred])).sum()
     #calculating multiple metrics
     precision = precision_score(y_true = dframe[ytrue], y_pred = dframe[ypred], pos_label = 1, zero_division = 0)
     recall = recall_score(y_true = dframe[ytrue], y_pred = dframe[ypred], pos_label = 1, zero_division = 0)
+    false_positive_rate = false_positives/(false_positives+true_negatives)
     f1score = f1_score(y_true = dframe[ytrue], y_pred = dframe[ypred], pos_label = 1)
     auc_pr = average_precision_score(y_true = dframe[ytrue], y_score = dframe[scores], pos_label=1)
+    fraudmissed_dollar = (dframe[amount]*dframe[ytrue]*(1-dframe[ypred])).sum()
+    fraudmissed_dollar_rate = 100*(dframe[amount]*dframe[ytrue]*(1-dframe[ypred])).sum()/(dframe[amount]*dframe[ytrue]).sum()
     fraud_rate = dframe[ytrue].sum()/len(dframe.index)
     avg_score = dframe[scores].sum()/len(dframe.index)
     try:
@@ -146,9 +155,10 @@ def weekly_evaluator(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCOR
     
     
     return pd.Series({'precision': precision, 'recall': recall, 'f1score': f1score, 'auc_pr':auc_pr, 'auc_roc':auc_roc,
-                     'fraud_rate': fraud_rate, 'avg_score': avg_score})
+                     'fraud_rate': fraud_rate, 'avg_score': avg_score,'false_positive_rate':false_positive_rate,
+                      'fraudmissed_dollar': fraudmissed_dollar,'fraudmissed_dollar_rate':fraudmissed_dollar_rate})
 
-
+#function to create metric values for tables in Google Sheets
 #function to create metric values for tables in Google Sheets
 def values_for_cells(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCORE_COL, timecol = TIME_COL, amount = AMOUNT_COL):
    
@@ -165,68 +175,67 @@ def values_for_cells(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCOR
    
     #creating different datasets for the different time periods
 
-    data_first30 = dframe.query('{0} > @modeltrain_date_start & {0} < @modeltrain_date_end'.format(TIME_COL))
+    data_overall = dframe.query('{0} > @modeltrain_date_start'.format(TIME_COL))
     data_last30 = dframe.query('{0} > @prev30_date & {0} < @today_date'.format(TIME_COL))
     data_prev30 = dframe.query('{0} > @prev60_date & {0} < @prev30_date'.format(TIME_COL))   
 
     #PRECISION
-    precision_current = precision_score(y_true = data_last30[ytrue], y_pred = data_last30[ypred], pos_label = 1)
-    precision_initial = precision_score(y_true = data_first30[ytrue], y_pred = data_first30[ypred], pos_label = 1)
+    precision_last30 = precision_score(y_true = data_last30[ytrue], y_pred = data_last30[ypred], pos_label = 1)
+    precision_overall = precision_score(y_true = data_overall[ytrue], y_pred = data_overall[ypred], pos_label = 1)
     precision_prev30 = precision_score(y_true = data_prev30[ytrue], y_pred = data_prev30[ypred], pos_label = 1)
 
     #recall values
-    recall_current = recall_score(y_true = data_last30[ytrue], y_pred = data_last30[ypred], pos_label = 1)
-    recall_initial = recall_score(y_true = data_first30[ytrue], y_pred = data_first30[ypred], pos_label = 1)
+    recall_last30 = recall_score(y_true = data_last30[ytrue], y_pred = data_last30[ypred], pos_label = 1)
+    recall_overall = recall_score(y_true = data_overall[ytrue], y_pred = data_overall[ypred], pos_label = 1)
     recall_prev30 = recall_score(y_true = data_prev30[ytrue], y_pred = data_prev30[ypred], pos_label = 1) 
+    
+    #False positive rates
+    fp_last30 = ((1-data_last30[ytrue]) * data_last30[ypred]).sum()/(((1-data_last30[ytrue]) * data_last30[ypred]).sum() + ((1-data_overall[ytrue]) * (1-data_overall[ypred])).sum())
+    fp_overall = ((1-data_overall[ytrue]) * data_overall[ypred]).sum()/(((1-data_overall[ytrue]) * data_overall[ypred]).sum() + ((1-data_overall[ytrue]) * (1-data_overall[ypred])).sum())
+    fp_prev30 = ((1-data_prev30[ytrue]) * data_prev30[ypred]).sum()/(((1-data_prev30[ytrue]) * data_prev30[ypred]).sum() + ((1-data_prev30[ytrue]) * (1-data_prev30[ypred])).sum())
 
     #F1 score
-    f1_current = f1_score(y_true = data_last30[ytrue], y_pred = data_last30[ypred], pos_label = 1)
-    f1_initial = f1_score(y_true = data_first30[ytrue], y_pred = data_first30[ypred], pos_label = 1)
+    f1_last30 = f1_score(y_true = data_last30[ytrue], y_pred = data_last30[ypred], pos_label = 1)
+    f1_overall = f1_score(y_true = data_overall[ytrue], y_pred = data_overall[ypred], pos_label = 1)
     f1_prev30 = f1_score(y_true = data_prev30[ytrue], y_pred = data_prev30[ypred], pos_label = 1) 
 
     #auc pr
-    aucpr_current = average_precision_score(y_true = data_last30[ytrue], y_score = data_last30[scores], pos_label = 1)
-    aucpr_initial = average_precision_score(y_true = data_first30[ytrue], y_score = data_first30[scores], pos_label = 1)
+    aucpr_last30 = average_precision_score(y_true = data_last30[ytrue], y_score = data_last30[scores], pos_label = 1)
+    aucpr_overall = average_precision_score(y_true = data_overall[ytrue], y_score = data_overall[scores], pos_label = 1)
     aucpr_prev30 = average_precision_score(y_true = data_prev30[ytrue], y_score = data_prev30[scores], pos_label = 1) 
 
     #auc roc
-    aucroc_current = roc_auc_score(y_true = data_last30[ytrue], y_score = data_last30[scores])
-    aucroc_initial = roc_auc_score(y_true = data_first30[ytrue], y_score = data_first30[scores])
+    aucroc_last30 = roc_auc_score(y_true = data_last30[ytrue], y_score = data_last30[scores])
+    aucroc_overall = roc_auc_score(y_true = data_overall[ytrue], y_score = data_overall[scores])
     aucroc_prev30 = roc_auc_score(y_true = data_prev30[ytrue], y_score = data_prev30[scores]) 
 
     #TODO - Confirm fraud rate definition
     #fraud rate
-    fraudrate_current = data_last30[ytrue].sum()/len(data_last30.index)
-    fraudrate_initial = data_first30[ytrue].sum()/len(data_first30.index)
+    fraudrate_last30 = data_last30[ytrue].sum()/len(data_last30.index)
+    fraudrate_overall = data_overall[ytrue].sum()/len(data_overall.index)
     fraudrate_prev30 = data_prev30[ytrue].sum()/len(data_prev30.index)
     
     #avg score
-    avgscore_current = data_last30[scores].sum()/len(data_last30.index)
-    avgscore_initial = data_first30[scores].sum()/len(data_first30.index)
+    avgscore_last30 = data_last30[scores].sum()/len(data_last30.index)
+    avgscore_overall = data_overall[scores].sum()/len(data_overall.index)
     avgscore_prev30 = data_prev30[scores].sum()/len(data_prev30.index)
 
-
-    #TODO - Confirm fraud missed definition
-    #fraud rate with dollar values
-    fraudrate_dollar_current = (data_last30[amount]*data_last30[YTRUE_COL]).sum()/data_last30[amount].sum()
-    fraudrate_dollar_initial = (data_first30[amount]*data_first30[YTRUE_COL]).sum()/data_first30[amount].sum()
-    fraudrate_dollar_prev30 = (data_prev30[amount]*data_prev30[YTRUE_COL]).sum()/data_prev30[amount].sum()
-
     #$ value of fraud missed
-    fraudmissed_dollar_current = (data_last30[amount]*data_last30[YTRUE_COL]*(1-data_last30[YPRED_COL])).sum()
-    fraudmissed_dollar_initial = (data_first30[amount]*data_first30[YTRUE_COL]*(1-data_first30[YPRED_COL])).sum()
-    fraudmissed_dollar_prev30 = (data_prev30[amount]*data_prev30[YTRUE_COL]*(1-data_prev30[YPRED_COL])).sum()
+    fraudmissed_dollar_last30 = (data_last30[amount]*data_last30[ytrue]*(1-data_last30[ypred])).sum()
+    fraudmissed_dollar_overall = (data_overall[amount]*data_overall[ytrue]*(1-data_overall[ypred])).sum()
+    fraudmissed_dollar_prev30 = (data_prev30[amount]*data_prev30[ytrue]*(1-data_prev30[ypred])).sum()
     
-   #fraud missed rate (false negative)
-    fraudmissed_rate_current = (data_last30[ytrue]*(1-data_last30[ypred])).sum()/data_last30[ytrue].sum()
-    fraudmissed_rate_initial = (data_first30[ytrue]*(1-data_first30[ypred])).sum()/data_first30[ytrue].sum()
-    fraudmissed_rate_prev30 = (data_prev30[ytrue]*(1-data_prev30[ypred])).sum()/data_prev30[ytrue].sum()
+    # $ value fraud rate
+    fraudmissed_dollar_rate_last30 = 100*(data_last30[amount]*data_last30[ytrue]*(1-data_last30[ypred])).sum()/(data_last30[amount]*data_last30[ytrue]).sum()
+    fraudmissed_dollar_rate_overall = 100*(data_overall[amount]*data_overall[ytrue]*(1-data_overall[ypred])).sum()/(data_overall[amount]*data_overall[ytrue]).sum()
+    fraudmissed_dollar_rate_prev30 = 100*(data_prev30[amount]*data_prev30[ytrue]*(1-data_prev30[ypred])).sum()/(data_prev30[amount]*data_prev30[ytrue]).sum()
+
     
 
-    output = {"metric": ['precision', 'recall','f1score', 'auc_pr', 'auc_roc', 'fraudrate', 'avg_score', 'fraudrate_dollar', 'fraudmissed_dollar', 'fraudmissed_rate'],
-             "current_values":[precision_current, recall_current, f1_current, aucpr_current, aucroc_current, fraudrate_current, avgscore_current, fraudrate_dollar_current, fraudmissed_dollar_current, fraudmissed_rate_current],
-             "initial_values":[precision_initial, recall_initial, f1_initial, aucpr_initial, aucroc_initial, fraudrate_initial, avgscore_initial, fraudrate_dollar_initial, fraudmissed_dollar_initial, fraudmissed_rate_initial],
-             "prev30_values":[precision_prev30, recall_prev30, f1_prev30, aucpr_prev30, aucroc_prev30, fraudrate_prev30, avgscore_prev30, fraudrate_dollar_prev30, fraudmissed_dollar_prev30, fraudmissed_rate_prev30]}    
+    output = {"metric": ['precision', 'recall','f1score', 'auc_pr', 'auc_roc', 'fraudrate', 'avg_score', 'falsepositive_rate', 'fraudmissed_dollar', 'fraudmissed_dollar_rate'],
+             "current_values":[precision_last30, recall_last30, f1_last30, aucpr_last30, aucroc_last30, fraudrate_last30, avgscore_last30, fp_last30, fraudmissed_dollar_last30, fraudmissed_dollar_rate_last30],
+             "initial_values":[precision_overall, recall_overall, f1_overall, aucpr_overall, aucroc_overall, fraudrate_overall, avgscore_overall, fp_overall, fraudmissed_dollar_overall, fraudmissed_dollar_rate_overall],
+             "prev30_values":[precision_prev30, recall_prev30, f1_prev30, aucpr_prev30, aucroc_prev30, fraudrate_prev30, avgscore_prev30, fp_prev30, fraudmissed_dollar_prev30, fraudmissed_dollar_rate_prev30]}    
         
     return output
 
@@ -235,15 +244,12 @@ def values_for_cells(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCOR
 #Function to create baseline data that will be used in charts
 def create_baseline_data(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = SCORE_COL, timecol = TIME_COL, amount = AMOUNT_COL):
     #Setting up variables with different date values
-    model_start_date = min(dframe[TIME_COL])
-    model_start_date = datetime.strptime(model_start_date, '%Y-%m-%d %H:%M:%S.%f').date()
-     
-    modeltrain_date_start = (model_start_date + timedelta(days = 30)).strftime("%Y-%m-%d")
-    modeltrain_date_end = (model_start_date + timedelta(days = 60)).strftime("%Y-%m-%d")
+    modeltrain_date_start = datetime.strptime(MODEL_START_DATE, "%Y-%m-%d")
+    modeltrain_date_end = (modeltrain_date_start + timedelta(days = 60)).strftime("%Y-%m-%d")
     
     #creating different datasets for the different time periods
     
-    #dataset 1 - 30 days after model was trained
+    #dataset 1 - 60 days after model was trained
     data_first30 = dframe.query('{0} > @MODEL_START_DATE & {0} < @modeltrain_date_end'.format(TIME_COL))
     
     #PRECISION
@@ -251,6 +257,9 @@ def create_baseline_data(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = 
     
     #recall values
     recall_initial = recall_score(y_true = data_first30[ytrue], y_pred = data_first30[ypred], pos_label = 1)
+    
+    #False positive rate values
+    fp_initial = ((1-data_first30[ytrue]) * data_first30[ypred]).sum()/(((1-data_first30[ytrue]) * data_first30[ypred]).sum() + ((1-data_first30[ytrue]) * (1-data_first30[ypred])).sum())
     
     #F1 score
     f1_initial = f1_score(y_true = data_first30[ytrue], y_pred = data_first30[ypred], pos_label = 1)
@@ -270,10 +279,10 @@ def create_baseline_data(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = 
 
     #TODO - Confirm fraud missed definition
     #fraud rate with dollar values
-    fraudrate_dollar_initial = (data_first30[amount]*data_first30[YTRUE_COL]).sum()/data_first30[amount].sum()
+    fraudmissed_dollar_initial = (data_first30[amount]*data_first30[ytrue]*(1-data_first30[ypred])).sum()
 
     #$ value of fraud missed
-    fraudmissed_dollar_initial = data_first30[scores].sum()/len(data_first30.index)
+    fraudmissed_dollar_rate_initial = 100*(data_first30[amount]*data_first30[ytrue]*(1-data_first30[ypred])).sum()/(data_first30[amount]*data_first30[ytrue]).sum()
     
     #creating grouped by data frame with needed weeks
     baseline_dataframe = pd.DataFrame(dframe[WEEKSTART_COL].unique()).rename(columns={0: WEEKSTART_COL}).sort_values(by = WEEKSTART_COL)
@@ -284,19 +293,22 @@ def create_baseline_data(dframe, ytrue = YTRUE_COL, ypred = YPRED_COL, scores = 
                               aucroc_baseline = aucroc_initial,
                               fraudrate_baseline = fraudrate_initial,
                               avgscore_baseline = avgscore_initial,
-                              fraudrate_dollar_baseline = fraudrate_dollar_initial,
-                              fraudmissed_dollar_baseline = fraudmissed_dollar_initial
+                              falsepositive_rate_baseline =  fp_initial,                     
+                              fraudmissed_dollar_baseline = fraudmissed_dollar_initial,
+                              fraudmissed_dollar_rate_baseline = fraudmissed_dollar_rate_initial
                               )
-    baseline_dataframe[WEEKSTART_COL] = byWeek_stats[WEEKSTART_COL].astype(str)
     
     return baseline_dataframe
-
+    
+    
 
 def sheets_updater(workbook_key, google_key_file, byweek_dataset, tables_dataset, baselines_dataset):
     
     #authorization
+    keys = json.dumps(trellis.keys('amount_drive_details'))
+    loaded_keys = json.loads(keys)
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    credentials = ServiceAccountCredentials.from_json_keyfile_name(google_key_file, scope)
+    credentials = ServiceAccountCredentials._from_parsed_json_keyfile(loaded_keys, scope)
     gc = gspread.authorize(credentials)
     
     
@@ -317,8 +329,11 @@ def sheets_updater(workbook_key, google_key_file, byweek_dataset, tables_dataset
     tablesdata_worksheet.update([tables_dataset.columns.values.tolist()] + tables_dataset.values.tolist())
     baselinedata_worksheet.update([baselines_dataset.columns.values.tolist()] + baselines_dataset.values.tolist())
     
+    
 
-
+###############################################################################
+#Creating datasets and update google sheets
+###############################################################################
 
 #creating base table
 applications_data = base_table_creator()
@@ -338,7 +353,6 @@ baseline_data = create_baseline_data(applications_data)
 #updating google sheets
 sheets_updater(workbook_key = sheet_key, google_key_file = google_key_file, 
                byweek_dataset = byWeek_stats, tables_dataset = tables_data, baselines_dataset = baseline_data)
-
 
 
 
